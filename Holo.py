@@ -1,11 +1,12 @@
 import os
 import hashlib
 import logging
+import platform
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import padding
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import padding, hashes
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from base64 import urlsafe_b64encode, urlsafe_b64decode
 from getpass import getpass
 from datetime import datetime
@@ -31,7 +32,24 @@ def hash_file(file_path):
         hasher.update(buf)
     return hasher.hexdigest()
 
-def encrypt_file(file_path, key):
+def hide_file(file_path):
+    if platform.system() == 'Windows':
+        os.system(f'attrib +h "{file_path}"')
+    elif platform.system() == 'Darwin':  # macOS
+        os.system(f'chflags hidden "{file_path}"')
+    elif platform.system() == 'Linux':
+        os.rename(file_path, f'.{file_path}')
+
+def unhide_file(file_path):
+    if platform.system() == 'Windows':
+        os.system(f'attrib -h "{file_path}"')
+    elif platform.system() == 'Darwin':  # macOS
+        os.system(f'chflags nohidden "{file_path}"')
+    elif platform.system() == 'Linux':
+        if file_path.startswith('.'):
+            os.rename(file_path, file_path[1:])
+
+def encrypt_file_double(file_path, key):
     try:
         original_hash = hash_file(file_path)
         
@@ -41,31 +59,42 @@ def encrypt_file(file_path, key):
         padder = padding.PKCS7(128).padder()
         padded_data = padder.update(data) + padder.finalize()
 
-        iv = os.urandom(16)
-        cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-        encryptor = cipher.encryptor()
-        encrypted_data = iv + encryptor.update(padded_data) + encryptor.finalize()
+        iv_aes = os.urandom(16)
+        cipher_aes = Cipher(algorithms.AES(key), modes.CFB(iv_aes), backend=default_backend())
+        encryptor_aes = cipher_aes.encryptor()
+        encrypted_data_aes = iv_aes + encryptor_aes.update(padded_data) + encryptor_aes.finalize()
+        
+        chacha_key = os.urandom(32)
+        chacha = ChaCha20Poly1305(chacha_key)
+        nonce = os.urandom(12)
+        encrypted_data_chacha = nonce + chacha.encrypt(nonce, encrypted_data_aes, None)
 
         with open(file_path + ".enc", 'wb') as file:
-            file.write(encrypted_data)
+            file.write(encrypted_data_chacha)
         
         with open(file_path + ".hash", 'w') as hash_file:
             hash_file.write(original_hash)
         
         os.remove(file_path)
-        logging.info(f"File encrypted: {file_path}")
+        hide_file(file_path + ".enc")
+        hide_file(file_path + ".hash")
+        logging.info(f"File encrypted with double encryption: {file_path}")
     except Exception as e:
-        logging.error(f"Error encrypting file {file_path}: {e}")
+        logging.error(f"Error encrypting file with double encryption {file_path}: {e}")
 
-def decrypt_file(file_path, key):
+def decrypt_file_double(file_path, key):
     try:
+        unhide_file(file_path)
         with open(file_path, 'rb') as file:
-            encrypted_data = file.read()
+            encrypted_data_chacha = file.read()
         
-        iv = encrypted_data[:16]
-        cipher = Cipher(algorithms.AES(key), modes.CFB(iv), backend=default_backend())
-        decryptor = cipher.decryptor()
-        padded_data = decryptor.update(encrypted_data[16:]) + decryptor.finalize()
+        nonce = encrypted_data_chacha[:12]
+        encrypted_data_aes = ChaCha20Poly1305.decrypt(nonce, encrypted_data_chacha[12:], None)
+
+        iv_aes = encrypted_data_aes[:16]
+        cipher_aes = Cipher(algorithms.AES(key), modes.CFB(iv_aes), backend=default_backend())
+        decryptor_aes = cipher_aes.decryptor()
+        padded_data = decryptor_aes.update(encrypted_data_aes[16:]) + decryptor_aes.finalize()
 
         unpadder = padding.PKCS7(128).unpadder()
         data = unpadder.update(padded_data) + unpadder.finalize()
@@ -73,6 +102,7 @@ def decrypt_file(file_path, key):
         with open(file_path[:-4], 'wb') as file:
             file.write(data)
         
+        unhide_file(file_path[:-4] + ".hash")
         with open(file_path[:-4] + ".hash", 'r') as hash_file:
             original_hash = hash_file.read().strip()
         
@@ -84,9 +114,29 @@ def decrypt_file(file_path, key):
             raise ValueError(f"File integrity check failed for {file_path[:-4]}")
         
         os.remove(file_path[:-4] + ".hash")
-        logging.info(f"File decrypted: {file_path[:-4]}")
+        logging.info(f"File decrypted with double encryption: {file_path[:-4]}")
     except Exception as e:
-        logging.error(f"Error decrypting file {file_path}: {e}")
+        logging.error(f"Error decrypting file with double encryption {file_path}: {e}")
+
+def update_password(folder_path, old_password, new_password):
+    try:
+        unhide_file(os.path.join(folder_path, 'salt.key'))
+        with open(os.path.join(folder_path, 'salt.key'), 'rb') as salt_file:
+            salt = salt_file.read()
+        
+        old_key = generate_key(old_password, salt)
+        new_key = generate_key(new_password, salt)
+
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                if file.endswith('.enc'):
+                    file_path = os.path.join(root, file)
+                    decrypt_file_double(file_path, old_key)
+                    encrypt_file_double(file_path[:-4], new_key)
+
+        logging.info(f"Password updated for folder: {folder_path}")
+    except Exception as e:
+        logging.error(f"Error updating password for folder {folder_path}: {e}")
 
 def encrypt_folder(folder_path, password):
     try:
@@ -96,16 +146,18 @@ def encrypt_folder(folder_path, password):
         for root, _, files in os.walk(folder_path):
             for file in files:
                 file_path = os.path.join(root, file)
-                encrypt_file(file_path, key)
+                encrypt_file_double(file_path, key)
         
         with open(os.path.join(folder_path, 'salt.key'), 'wb') as salt_file:
             salt_file.write(salt)
+        hide_file(os.path.join(folder_path, 'salt.key'))
         logging.info(f"Folder encrypted: {folder_path}")
     except Exception as e:
         logging.error(f"Error encrypting folder {folder_path}: {e}")
 
 def decrypt_folder(folder_path, password):
     try:
+        unhide_file(os.path.join(folder_path, 'salt.key'))
         with open(os.path.join(folder_path, 'salt.key'), 'rb') as salt_file:
             salt = salt_file.read()
 
@@ -115,7 +167,7 @@ def decrypt_folder(folder_path, password):
             for file in files:
                 if file.endswith('.enc'):
                     file_path = os.path.join(root, file)
-                    decrypt_file(file_path, key)
+                    decrypt_file_double(file_path, key)
         
         os.remove(os.path.join(folder_path, 'salt.key'))
         logging.info(f"Folder decrypted: {folder_path}")
@@ -147,31 +199,40 @@ def start_decryption():
     decrypt_folder(folder_path, password)
     messagebox.showinfo("Success", "Folder decrypted successfully.")
 
+def start_update_password():
+    folder_path = folder_entry.get()
+    old_password = old_password_entry.get()
+    new_password = new_password_entry.get()
+    if not folder_path or not old_password or not new_password:
+        messagebox.showwarning("Input Error", "Please enter folder path, old password, and new password")
+        return
+
+    update_password(folder_path, old_password, new_password)
+    messagebox.showinfo("Success", "Password updated successfully.")
+
 root = tk.Tk()
-root.title("Folder Encryption/Decryption")
+root.title("Folder Encryption Tool")
 
-frame = tk.Frame(root)
-frame.pack(pady=20)
+tk.Label(root, text="Folder Path:").grid(row=0, column=0, padx=10, pady=10)
+folder_entry = tk.Entry(root, width=50)
+folder_entry.grid(row=0, column=1, padx=10, pady=10)
+tk.Button(root, text="Browse", command=select_folder).grid(row=0, column=2, padx=10, pady=10)
 
-folder_label = tk.Label(frame, text="Folder Path:")
-folder_label.grid(row=0, column=0, padx=5, pady=5)
+tk.Label(root, text="Password:").grid(row=1, column=0, padx=10, pady=10)
+password_entry = tk.Entry(root, show="*", width=50)
+password_entry.grid(row=1, column=1, padx=10, pady=10)
 
-folder_entry = tk.Entry(frame, width=50)
-folder_entry.grid(row=0, column=1, padx=5, pady=5)
+tk.Button(root, text="Encrypt Folder", command=start_encryption).grid(row=2, column=0, columnspan=3, padx=10, pady=10)
+tk.Button(root, text="Decrypt Folder", command=start_decryption).grid(row=3, column=0, columnspan=3, padx=10, pady=10)
 
-folder_button = tk.Button(frame, text="Browse", command=select_folder)
-folder_button.grid(row=0, column=2, padx=5, pady=5)
+tk.Label(root, text="Old Password:").grid(row=4, column=0, padx=10, pady=10)
+old_password_entry = tk.Entry(root, show="*", width=50)
+old_password_entry.grid(row=4, column=1, padx=10, pady=10)
 
-password_label = tk.Label(frame, text="Password:")
-password_label.grid(row=1, column=0, padx=5, pady=5)
+tk.Label(root, text="New Password:").grid(row=5, column=0, padx=10, pady=10)
+new_password_entry = tk.Entry(root, show="*", width=50)
+new_password_entry.grid(row=5, column=1, padx=10, pady=10)
 
-password_entry = tk.Entry(frame, show='*', width=50)
-password_entry.grid(row=1, column=1, padx=5, pady=5)
-
-encrypt_button = tk.Button(frame, text="Encrypt", command=start_encryption)
-encrypt_button.grid(row=2, column=0, columnspan=3, pady=10)
-
-decrypt_button = tk.Button(frame, text="Decrypt", command=start_decryption)
-decrypt_button.grid(row=3, column=0, columnspan=3, pady=10)
+tk.Button(root, text="Update Password", command=start_update_password).grid(row=6, column=0, columnspan=3, padx=10, pady=10)
 
 root.mainloop()
