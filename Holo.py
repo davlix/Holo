@@ -2,6 +2,8 @@ import os
 import hashlib
 import logging
 import platform
+import win32security
+import pywintypes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
@@ -12,6 +14,8 @@ from getpass import getpass
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import time
+import threading
 
 logging.basicConfig(filename='encryption_activity.log', level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -33,21 +37,10 @@ def hash_file(file_path):
     return hasher.hexdigest()
 
 def hide_file(file_path):
-    if platform.system() == 'Windows':
-        os.system(f'attrib +h "{file_path}"')
-    elif platform.system() == 'Darwin':  # macOS
-        os.system(f'chflags hidden "{file_path}"')
-    elif platform.system() == 'Linux':
-        os.rename(file_path, f'.{file_path}')
+    os.system(f'attrib +h "{file_path}"')
 
 def unhide_file(file_path):
-    if platform.system() == 'Windows':
-        os.system(f'attrib -h "{file_path}"')
-    elif platform.system() == 'Darwin':  # macOS
-        os.system(f'chflags nohidden "{file_path}"')
-    elif platform.system() == 'Linux':
-        if file_path.startswith('.'):
-            os.rename(file_path, file_path[1:])
+    os.system(f'attrib -h "{file_path}"')
 
 def encrypt_file_double(file_path, key):
     try:
@@ -78,6 +71,10 @@ def encrypt_file_double(file_path, key):
         os.remove(file_path)
         hide_file(file_path + ".enc")
         hide_file(file_path + ".hash")
+        
+        set_read_only(file_path + ".enc")
+        set_read_only(file_path + ".hash")
+
         logging.info(f"File encrypted with double encryption: {file_path}")
     except Exception as e:
         logging.error(f"Error encrypting file with double encryption {file_path}: {e}")
@@ -85,11 +82,13 @@ def encrypt_file_double(file_path, key):
 def decrypt_file_double(file_path, key):
     try:
         unhide_file(file_path)
+        remove_read_only(file_path)
+
         with open(file_path, 'rb') as file:
             encrypted_data_chacha = file.read()
         
         nonce = encrypted_data_chacha[:12]
-        encrypted_data_aes = ChaCha20Poly1305.decrypt(nonce, encrypted_data_chacha[12:], None)
+        encrypted_data_aes = ChaCha20Poly1305(key).decrypt(nonce, encrypted_data_chacha[12:], None)
 
         iv_aes = encrypted_data_aes[:16]
         cipher_aes = Cipher(algorithms.AES(key), modes.CFB(iv_aes), backend=default_backend())
@@ -103,6 +102,8 @@ def decrypt_file_double(file_path, key):
             file.write(data)
         
         unhide_file(file_path[:-4] + ".hash")
+        remove_read_only(file_path[:-4] + ".hash")
+
         with open(file_path[:-4] + ".hash", 'r') as hash_file:
             original_hash = hash_file.read().strip()
         
@@ -121,6 +122,8 @@ def decrypt_file_double(file_path, key):
 def update_password(folder_path, old_password, new_password):
     try:
         unhide_file(os.path.join(folder_path, 'salt.key'))
+        remove_read_only(os.path.join(folder_path, 'salt.key'))
+
         with open(os.path.join(folder_path, 'salt.key'), 'rb') as salt_file:
             salt = salt_file.read()
         
@@ -151,13 +154,23 @@ def encrypt_folder(folder_path, password):
         with open(os.path.join(folder_path, 'salt.key'), 'wb') as salt_file:
             salt_file.write(salt)
         hide_file(os.path.join(folder_path, 'salt.key'))
+        set_read_only(os.path.join(folder_path, 'salt.key'))
+
         logging.info(f"Folder encrypted: {folder_path}")
+
+        # Start monitoring the folder for new files and folders
+        monitor_thread = threading.Thread(target=monitor_folder, args=(folder_path, key))
+        monitor_thread.daemon = True
+        monitor_thread.start()
+
     except Exception as e:
         logging.error(f"Error encrypting folder {folder_path}: {e}")
 
 def decrypt_folder(folder_path, password):
     try:
         unhide_file(os.path.join(folder_path, 'salt.key'))
+        remove_read_only(os.path.join(folder_path, 'salt.key'))
+
         with open(os.path.join(folder_path, 'salt.key'), 'rb') as salt_file:
             salt = salt_file.read()
 
@@ -173,6 +186,26 @@ def decrypt_folder(folder_path, password):
         logging.info(f"Folder decrypted: {folder_path}")
     except Exception as e:
         logging.error(f"Error decrypting folder {folder_path}: {e}")
+
+def set_read_only(file_path):
+    try:
+        sd = win32security.GetFileSecurity(file_path, win32security.DACL_SECURITY_INFORMATION)
+        dacl = sd.GetSecurityDescriptorDacl()
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32security.FILE_GENERIC_READ, win32security.GetUserName())
+        sd.SetSecurityDescriptorDacl(1, dacl, 0)
+        win32security.SetFileSecurity(file_path, win32security.DACL_SECURITY_INFORMATION, sd)
+    except pywintypes.error as e:
+        logging.error(f"Error setting read-only attribute for {file_path}: {e}")
+
+def remove_read_only(file_path):
+    try:
+        sd = win32security.GetFileSecurity(file_path, win32security.DACL_SECURITY_INFORMATION)
+        dacl = sd.GetSecurityDescriptorDacl()
+        dacl.DeleteAce(dacl.GetAceCount() - 1)
+        sd.SetSecurityDescriptorDacl(1, dacl, 0)
+        win32security.SetFileSecurity(file_path, win32security.DACL_SECURITY_INFORMATION, sd)
+    except pywintypes.error as e:
+        logging.error(f"Error removing read-only attribute for {file_path}: {e}")
 
 def select_folder():
     folder_path = filedialog.askdirectory()
@@ -209,6 +242,19 @@ def start_update_password():
 
     update_password(folder_path, old_password, new_password)
     messagebox.showinfo("Success", "Password updated successfully.")
+
+def monitor_folder(folder_path, key):
+    while True:
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                if not file.endswith('.enc') and not file.endswith('.hash') and not os.path.isfile(file_path + ".enc"):
+                    encrypt_file_double(file_path, key)
+        time.sleep(5)
+
+if platform.system() != "Windows":
+    messagebox.showerror("OS Error", "This program only supports Windows OS")
+    exit()
 
 root = tk.Tk()
 root.title("Folder Encryption Tool")
